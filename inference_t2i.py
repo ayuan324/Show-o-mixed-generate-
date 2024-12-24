@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import os
-
+import json
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 from PIL import Image
 from tqdm import tqdm
@@ -27,6 +27,7 @@ from training.utils import get_config, flatten_omega_conf, image_transform
 from transformers import AutoTokenizer
 import torch.nn.functional as F
 
+
 def get_vq_model_class(model_type):
     if model_type == "magvitv2":
         return MAGVITv2
@@ -36,6 +37,9 @@ def get_vq_model_class(model_type):
 if __name__ == '__main__':
 
     config = get_config()
+    config.dataset.intent_dataset_path = "/root/autodl-tmp/Show-o" 
+    config.mode = 'intent' 
+    config.experiment.output_dir = "/root/autodl-tmp/Show-o/inference_output" 
 
     resume_wandb_run = config.wandb.resume
     run_id = config.wandb.get("run_id", None)
@@ -77,7 +81,106 @@ if __name__ == '__main__':
     config.training.generation_timesteps = config.generation_timesteps
     # load from users passed arguments
 
-    if config.mode == 'inpainting':
+    if config.mode == 'intent':
+        with open(os.path.join(config.dataset.intent_dataset_path, "Data_results.json"), 'r') as f: 
+            intent_data = json.load(f)
+        
+        for item_id, item_data in tqdm(intent_data.items()):
+            input_image_path = os.path.join(config.dataset.intent_dataset_path, "images", item_data["data"]["input_path"].split("\\")[-1]) 
+
+            input_image = Image.open(input_image_path).convert("RGB")
+            input_image = image_transform(input_image, resolution=config.dataset.params.resolution).to(device)
+            input_image = input_image.unsqueeze(0) # 添加 batch 维度
+
+            input_image_tokens = vq_model.get_code(input_image) + len(uni_prompting.text_tokenizer)
+
+            prompt_text = "请预测图中主体的意图，并预测描述即将发生的事情，并生成相应的图片。"
+            
+            prompt_input_ids = tokenizer(prompt_text, return_tensors="pt", padding="longest").input_ids.to(device)
+
+            # 构建输入序列
+            input_ids = torch.cat([
+                torch.full((1, 1), uni_prompting.sptids_dict['<|t2i|>'], dtype=torch.long, device=device),
+                torch.full((1, 1), uni_prompting.sptids_dict['<|sot|>'], dtype=torch.long, device=device),
+                prompt_input_ids,
+                torch.full((1, 1), uni_prompting.sptids_dict['<|eot|>'], dtype=torch.long, device=device),
+                torch.full((1, 1), uni_prompting.sptids_dict['<|soi|>'], dtype=torch.long, device=device),
+                input_image_tokens,
+                torch.full((1, 1), uni_prompting.sptids_dict['<|eoi|>'], dtype=torch.long, device=device),
+            ], dim=1)
+
+            attention_mask = create_attention_mask_predict_next(input_ids,
+                                                                pad_id=int(uni_prompting.sptids_dict['<|pad|>']),
+                                                                soi_id=int(uni_prompting.sptids_dict['<|soi|>']),
+                                                                eoi_id=int(uni_prompting.sptids_dict['<|eoi|>']),
+                                                                sot_id=int(uni_prompting.sptids_dict['<|sot|>']),
+                                                                eot_id=int(uni_prompting.sptids_dict['<|eot|>']),
+                                                                )
+
+            if config.get("mask_schedule", None) is not None:
+                schedule = config.mask_schedule.schedule
+                args = config.mask_schedule.get("params", {})
+                mask_schedule = get_mask_chedule(schedule, **args)
+            else:
+                mask_schedule = get_mask_chedule(config.training.get("mask_schedule", "cosine"))
+
+            with torch.no_grad():
+                gen_ids = model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    temperature=config.training.get("generation_temperature", 1.0),
+                    max_new_tokens=512, # 可以根据需要调整
+                    # timesteps=config.training.generation_timesteps,
+                    # noise_schedule=mask_schedule,
+                    # noise_type=config.training.get("noise_type", "mask"),
+                    # seq_len=config.model.showo.num_vq_tokens,
+                    uni_prompting=uni_prompting,
+                    config=config,
+                    eot_token=tokenizer.eos_token_id,
+                    pad_token=tokenizer.pad_token_id,
+                )
+            # import pdb; pdb.set_trace()
+            gen_text_tokens = []
+            find_eot = False
+            for i in range(len(gen_ids[0])):
+                if gen_ids[0][i] != uni_prompting.sptids_dict['<|eot|>'] and not find_eot:
+                    continue
+                elif gen_ids[0][i] == uni_prompting.sptids_dict['<|eot|>']:
+                    find_eot = True
+                    continue
+                else:
+                    if gen_ids[0][i] != uni_prompting.sptids_dict['<|sov|>']:
+                        gen_text_tokens.append(gen_ids[0][i].item())
+                    else:
+                        break
+            
+            gen_text = tokenizer.decode(gen_text_tokens, skip_special_tokens=True)
+            
+            image_start_index = len(gen_text_tokens) + input_ids.size(1) + 1 # 找到图片 token 的起始位置
+            image_end_index = len(gen_text_tokens) + input_ids.size(1) + 1 + 256
+            gen_image_tokens = gen_ids[0, image_start_index:image_end_index]
+            gen_image_tokens = torch.clamp(gen_image_tokens, max=config.model.showo.codebook_size - 1, min=0)
+            gen_image = vq_model.decode_code(gen_image_tokens.unsqueeze(0))
+
+            gen_image = torch.clamp((gen_image + 1.0) / 2.0, min=0.0, max=1.0)
+            gen_image *= 255.0
+            gen_image = gen_image.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+            gen_image = Image.fromarray(gen_image[0])
+
+            result_dir = os.path.join(config.experiment.output_dir, "inference_results", item_id) 
+            os.makedirs(result_dir, exist_ok=True)
+            with open(os.path.join(result_dir, "gen_text.txt"), "w", encoding="utf-8") as f:
+                f.write(gen_text)
+            gen_image.save(os.path.join(result_dir, "gen_image.jpg"))
+
+            if config.wandb.get("log", None):
+              wandb.log({
+                  "input_image": wandb.Image(input_image_path),
+                  "generated_text": gen_text,
+                  "generated_image": wandb.Image(gen_image),
+              }, step=int(item_id))
+
+    elif config.mode == 'inpainting':
 
         prompt = [config.prompt] * config.batch_size
         inpainting_image = Image.open(config.image_path).convert("RGB")
